@@ -56,21 +56,53 @@ def iso(d):
 
 # ---------- animekarmalist ----------
 
-def fetch_episodes(start, end):
-    seen, out, offset = set(), [], 0
-    for _ in range(50):  # hard cap on pages
-        r = request("GET", KARMA_URL,
-                    params={"start": iso(start), "end": iso(end), "offset": offset})
-        r.raise_for_status()
-        page = r.json()
-        if not page:
-            break
-        fresh = [e for e in page if e["_id"] not in seen]
-        if not fresh:  # server ignored offset / repeated a page
-            break
-        seen.update(e["_id"] for e in fresh)
-        out.extend(fresh)
+PAGE_SIZE = 15  # the API returns at most 15 episodes per request
+MIN_SPLIT = dt.timedelta(hours=1)
+
+
+def get_page(start, end, offset):
+    """One API call. Returns None when the API rejects offset > 0 (400)."""
+    r = request("GET", KARMA_URL,
+                params={"start": iso(start), "end": iso(end), "offset": offset})
+    if r.status_code == 400 and offset > 0:
+        log(f"  offset={offset} rejected (400): {r.text[:150]!r}")
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_window(start, end):
+    """Fetch every episode in [start, end].
+
+    A page smaller than PAGE_SIZE means we have everything. A full page is paged
+    through with offset if the API allows it; if it doesn't, the window is split in
+    half and each half is fetched on its own, so no episodes are lost to the cap.
+    """
+    first = get_page(start, end, 0)
+    if len(first) < PAGE_SIZE:
+        return first
+    out, offset = list(first), len(first)
+    while True:
+        page = get_page(start, end, offset)
+        if page is None:  # can't page further -> split the window
+            if end - start > MIN_SPLIT:
+                mid = start + (end - start) / 2
+                log(f"  splitting {iso(start)} -> {iso(end)} at {iso(mid)}")
+                return fetch_window(start, mid) + fetch_window(mid, end)
+            log(f"  WARNING: {iso(start)} -> {iso(end)} is full and can't be split further")
+            return out
+        out.extend(page)
+        if len(page) < PAGE_SIZE:
+            return out
         offset += len(page)
+
+
+def fetch_episodes(start, end):
+    seen, out = set(), []
+    for e in fetch_window(start, end):
+        if e["_id"] not in seen:  # windows share a boundary; dedupe
+            seen.add(e["_id"])
+            out.append(e)
     return out
 
 
