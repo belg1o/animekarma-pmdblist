@@ -38,6 +38,12 @@ def request(method, url, **kw):
     r = None
     for attempt in range(6):
         r = session.request(method, url, timeout=30, **kw)
+        if r.status_code == 403 and "Just a moment" in r.text[:600]:
+            raise SystemExit(
+                f"BLOCKED: {url} returned a Cloudflare challenge page (403), not an API "
+                "response. PublicMetaDB is refusing requests from this IP (GitHub-hosted "
+                "runners use datacenter IPs). Run from a self-hosted runner / your own "
+                "machine, or ask PublicMetaDB to allow API-key traffic from CI.")
         if r.status_code == 429 or r.status_code >= 500:
             try:
                 wait = float(r.headers.get("Retry-After", ""))
@@ -56,51 +62,29 @@ def iso(d):
 
 # ---------- animekarmalist ----------
 
-PAGE_SIZE = 15  # the API returns at most 15 episodes per request
-MIN_SPLIT = dt.timedelta(hours=1)
-
-
-def get_page(start, end, offset):
-    """One API call. Returns None when the API rejects offset > 0 (400)."""
-    r = request("GET", KARMA_URL,
-                params={"start": iso(start), "end": iso(end), "offset": offset})
-    if r.status_code == 400 and offset > 0:
-        log(f"  offset={offset} rejected (400): {r.text[:150]!r}")
-        return None
-    r.raise_for_status()
-    return r.json()
+PAGE_SIZE = 15  # episodes per page; `offset` is the zero-based PAGE number, not an item offset
 
 
 def fetch_window(start, end):
-    """Fetch every episode in [start, end].
-
-    A page smaller than PAGE_SIZE means we have everything. A full page is paged
-    through with offset if the API allows it; if it doesn't, the window is split in
-    half and each half is fetched on its own, so no episodes are lost to the cap.
-    """
-    first = get_page(start, end, 0)
-    if len(first) < PAGE_SIZE:
-        return first
-    out, offset = list(first), len(first)
-    while True:
-        page = get_page(start, end, offset)
-        if page is None:  # can't page further -> split the window
-            if end - start > MIN_SPLIT:
-                mid = start + (end - start) / 2
-                log(f"  splitting {iso(start)} -> {iso(end)} at {iso(mid)}")
-                return fetch_window(start, mid) + fetch_window(mid, end)
-            log(f"  WARNING: {iso(start)} -> {iso(end)} is full and can't be split further")
-            return out
+    """Fetch every episode in [start, end], page by page (sorted by karma, 15 per page)."""
+    out = []
+    for page_no in range(100):  # hard cap
+        r = request("GET", KARMA_URL,
+                    params={"start": iso(start), "end": iso(end), "offset": page_no})
+        if r.status_code == 400 and page_no > 0:  # "offset value invalid" = past the last page
+            break
+        r.raise_for_status()
+        page = r.json()
         out.extend(page)
-        if len(page) < PAGE_SIZE:
-            return out
-        offset += len(page)
+        if len(page) < PAGE_SIZE:  # short or empty page = last page
+            break
+    return out
 
 
 def fetch_episodes(start, end):
     seen, out = set(), []
     for e in fetch_window(start, end):
-        if e["_id"] not in seen:  # windows share a boundary; dedupe
+        if e["_id"] not in seen:  # safety net against repeated pages
             seen.add(e["_id"])
             out.append(e)
     return out
@@ -120,6 +104,11 @@ def pick_titles(episodes):
 
 
 # ---------- PublicMetaDB ----------
+
+# Manual fixes: AniList id -> (TMDB id, "tv" | "movie"). Checked before anything else.
+OVERRIDES = {
+    191788: (126437, "tv"),  # Aoashi Season 2 (Fribb has no TMDB id; same TMDB show as S1)
+}
 
 FRIBB_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
 _pmdb_debug_left = 3  # log the first few raw PMDB lookup responses to diagnose misses
@@ -183,7 +172,9 @@ def pmdb_lookup(ep):
 
 def lookup_tmdb(ep, fribb):
     by_anilist, by_mal = fribb
-    found = by_anilist.get(ep.get("anilistId")) or by_mal.get(ep.get("malId"))
+    found = (OVERRIDES.get(ep.get("anilistId"))
+             or by_anilist.get(ep.get("anilistId"))
+             or by_mal.get(ep.get("malId")))
     return found or pmdb_lookup(ep)
 
 
