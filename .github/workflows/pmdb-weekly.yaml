@@ -1,0 +1,34 @@
+name: Update PMDB anime karma list
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Resolve titles and print them, but don't touch the list"
+        type: boolean
+        default: false
+
+concurrency:
+  group: pmdb-karma-list
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Rebuild list
+        run: python scripts/update_list.py
+        env:
+          PMDB_API_KEY: ${{ secrets.PMDB_API_KEY }}
+          PMDB_LIST_ID: ${{ vars.PMDB_LIST_ID }}
+          MIN_KARMA: "200"
+          WINDOW_DAYS: "7"
+          DRY_RUN: ${{ inputs.dry_run }}
