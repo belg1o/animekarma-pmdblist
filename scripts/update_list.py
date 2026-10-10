@@ -121,7 +121,47 @@ def pick_titles(episodes):
 
 # ---------- PublicMetaDB ----------
 
-def lookup_tmdb(ep):
+FRIBB_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
+_pmdb_debug_left = 3  # log the first few raw PMDB lookup responses to diagnose misses
+
+
+def parse_tmdb(entry):
+    """Fribb entry -> (tmdb_id, media_type) or None. Values are an int or a list."""
+    tm = entry.get("themoviedb_id")
+    if not isinstance(tm, dict):
+        return None
+    for media_type in ("tv", "movie"):
+        v = tm.get(media_type)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if v:
+            return int(v), media_type
+    return None
+
+
+def load_fribb():
+    """Community anime ID mapping: AniList/MAL id -> TMDB id."""
+    try:
+        r = request("GET", FRIBB_URL)
+        r.raise_for_status()
+        by_anilist, by_mal = {}, {}
+        for e in r.json():
+            tm = parse_tmdb(e)
+            if not tm:
+                continue
+            if e.get("anilist_id"):
+                by_anilist[e["anilist_id"]] = tm
+            if e.get("mal_id"):
+                by_mal[e["mal_id"]] = tm
+        log(f"Fribb mapping loaded: {len(by_anilist)} AniList ids with a TMDB id")
+        return by_anilist, by_mal
+    except Exception as exc:  # fall back to PMDB lookup only
+        log(f"WARNING: could not load Fribb mapping ({exc}); using PMDB lookup only")
+        return {}, {}
+
+
+def pmdb_lookup(ep):
+    global _pmdb_debug_left
     for id_type, field in (("anilist", "anilistId"), ("mal", "malId")):
         value = ep.get(field)
         if not value:
@@ -129,6 +169,9 @@ def lookup_tmdb(ep):
         r = request("GET", f"{PMDB}/mappings/lookup", headers=HEADERS,
                     params={"id_type": id_type, "id_value": value})
         time.sleep(PAUSE)
+        if _pmdb_debug_left > 0:
+            _pmdb_debug_left -= 1
+            log(f"  PMDB lookup {id_type}={value} -> {r.status_code}: {r.text[:300]}")
         if r.status_code != 200:
             continue
         results = r.json().get("results") or []
@@ -136,6 +179,12 @@ def lookup_tmdb(ep):
             res = results[0]
             return int(res["tmdb_id"]), res.get("media_type") or "tv"
     return None
+
+
+def lookup_tmdb(ep, fribb):
+    by_anilist, by_mal = fribb
+    found = by_anilist.get(ep.get("anilistId")) or by_mal.get(ep.get("malId"))
+    return found or pmdb_lookup(ep)
 
 
 def item_id(item):
@@ -179,9 +228,10 @@ def main():
     titles = pick_titles(episodes)
     log(f"{len(episodes)} episodes fetched, {len(titles)} shows above threshold")
 
+    fribb = load_fribb()
     targets, seen_tmdb, unmapped = [], set(), []
     for ep in titles:
-        found = lookup_tmdb(ep)
+        found = lookup_tmdb(ep, fribb)
         if not found:
             unmapped.append(ep["name"])
             continue
