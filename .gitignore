@@ -1,6 +1,11 @@
 .env
 sync_state.json
 sync_state.json.tmp
+schedule_state.json
+schedule_state.json.tmp
+schedule_state.json.lock
 run.log
 __pycache__/
 .pytest_cache/
+.venv/
+.uv-cache/

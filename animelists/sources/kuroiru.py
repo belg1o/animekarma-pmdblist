@@ -2,6 +2,8 @@
 
 `airingList.airing[].time` is the *next scheduled airing* for weekly anime, so the previous
 broadcast is reconstructed as time - 7 days (an approximation for irregular schedules).
+The Recently Released panel adds 3000 seconds to that estimate and includes rows
+where floor((next airing - now + 3000) / 86400) is 3, 4, 5 or 6 and lastep > 0.
 The daily trend feed refreshes every 6 hours (00/06/12/18 UTC) and is wiped at 00:00 UTC while
 keeping the last 6 hours: it covers 6h at 00:00, 12h at 06:00, 18h at 12:00 and a full 24h at
 18:00 UTC. Sync it shortly after 18:00 UTC.
@@ -9,6 +11,7 @@ keeping the last 6 hours: it covers 6h at 00:00, 12h at 06:00, 18h at 12:00 and 
 from __future__ import annotations
 
 import html
+import math
 import re
 import time
 from datetime import datetime, timezone
@@ -20,6 +23,8 @@ from ..core import Item
 URL = "https://kuroiru.co/app"
 TREND_URL = "https://kuroiru.co/data/public/quick/trendtoday.json"
 WEEK_SECONDS = 7 * 24 * 60 * 60
+RECENT_DELAY_SECONDS = 3000  # Kuroiru's client-side Recently Released panel
+RECENT_WINDOW_SECONDS = 4 * 24 * 60 * 60
 BROWSER = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -37,7 +42,25 @@ def _iso_utc(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def recent_rows(data: dict, now: float, hours: float) -> list[dict]:
+def _meets_minimums(anime: dict, min_members: int | None, min_score: float | None) -> bool:
+    """Enabled minimums are inclusive; missing or invalid values cannot meet them."""
+    for field, minimum in (("members", min_members), ("score", min_score)):
+        if minimum is None:
+            continue
+        raw = anime.get(field)
+        if isinstance(raw, bool):
+            return False
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(value) or value < minimum:
+            return False
+    return True
+
+
+def recent_rows(data: dict, now: float, hours: float | None = None, *,
+                min_members: int | None = None, min_score: float | None = None) -> list[dict]:
     results = []
     for anime in data["airing"]:
         if not isinstance(anime, dict):
@@ -45,13 +68,23 @@ def recent_rows(data: dict, now: float, hours: float) -> list[dict]:
         try:
             next_airing = float(anime["time"])
             episode = int(anime.get("lastep") or 0)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
-        if episode <= 0:
+        if episode <= 0 or not math.isfinite(next_airing):
             continue
         previous = next_airing - WEEK_SECONDS  # a weekly schedule is assumed
-        age_hours = (now - previous) / 3600
-        if not (0 <= age_hours <= hours):
+        if hours is None:
+            # Match the provider's panel rather than imposing our own age cutoff.
+            day_bucket = math.floor((next_airing - now + RECENT_DELAY_SECONDS) / 86400)
+            if not 2 < day_bucket < 7:
+                continue
+            released = previous + RECENT_DELAY_SECONDS
+        else:
+            released = previous
+            if not 0 <= (now - released) / 3600 <= hours:
+                continue
+        age_hours = (now - released) / 3600
+        if not _meets_minimums(anime, min_members, min_score):
             continue
         malid = anime.get("malid")
         results.append({
@@ -59,7 +92,7 @@ def recent_rows(data: dict, now: float, hours: float) -> list[dict]:
             "title": html.unescape(anime.get("title") or ""),
             "episode": episode,
             "total_episodes": anime.get("totalep"),
-            "estimated_released_at": _iso_utc(previous),
+            "estimated_released_at": _iso_utc(released),
             "next_airing_at": _iso_utc(next_airing),
             "hours_ago": round(age_hours, 2),
             "score": anime.get("score"),
@@ -70,11 +103,14 @@ def recent_rows(data: dict, now: float, hours: float) -> list[dict]:
     return results
 
 
-def _ranked(rows: list[dict], top: int) -> list[dict]:
-    """One row per MAL id, most views first."""
+def _ranked(rows: list[dict], top: int, *,
+            min_members: int | None = None, min_score: float | None = None) -> list[dict]:
+    """One row per MAL id, most views first; filter before taking the top rows."""
     seen, out = set(), []
     for anime in rows:
         if not isinstance(anime, dict):
+            continue
+        if not _meets_minimums(anime, min_members, min_score):
             continue
         malid = anime.get("malid")
         try:
@@ -116,22 +152,28 @@ class Kuroiru:
             self._data = parse_airing_list(self.text)
         return self._data
 
-    def recent(self, hours: float = 96) -> list[Item]:
-        rows = recent_rows(self.data, time.time(), hours)
+    def recent(self, hours: float | None = None, *,
+               min_members: int | None = None, min_score: float | None = None) -> list[Item]:
+        rows = recent_rows(self.data, time.time(), hours,
+                           min_members=min_members, min_score=min_score)
         return _items(rows, lambda r: f"ep {r['episode']}, {r['hours_ago']:g}h ago")
 
-    def popular(self, top: int = 30) -> list[Item]:
+    def popular(self, top: int = 30, *,
+                min_members: int | None = None, min_score: float | None = None) -> list[Item]:
         """Weekly most-viewed ranking: `airingList.popular`, ordered by hits."""
         popular = self.data.get("popular")
         if not isinstance(popular, list):
             raise ValueError("airingList has no 'popular' array; keys seen: " + ", ".join(self.data))
-        return _items(_ranked(popular, top), lambda r: f"{r['hits']:,} weekly hits")
+        return _items(_ranked(popular, top, min_members=min_members, min_score=min_score),
+                      lambda r: f"{r['hits']:,} weekly hits")
 
-    def trending(self, top: int = 30) -> list[Item]:
+    def trending(self, top: int = 30, *,
+                 min_members: int | None = None, min_score: float | None = None) -> list[Item]:
         """Daily most-viewed ranking from trendtoday.json."""
         r = core.request("GET", TREND_URL, headers=BROWSER)
         r.raise_for_status()
-        return _items(_ranked(r.json(), top), lambda r: f"{r['hits']:,} daily hits")
+        return _items(_ranked(r.json(), top, min_members=min_members, min_score=min_score),
+                      lambda r: f"{r['hits']:,} daily hits")
 
     def print_vars(self) -> None:
         """Print every `var/let/const name = [...]|{...}` on the page that parses as JSON."""

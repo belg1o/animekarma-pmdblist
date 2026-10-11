@@ -55,13 +55,17 @@ class Mapper:
         self.resolvers = list(resolvers)
         self._fribb = None  # downloaded lazily: only when an id isn't cached
 
+    @staticmethod
+    def _keys(item: Item) -> list[str]:
+        return [f"{t}:{getattr(item, t)}" for t in ("anilist", "mal") if getattr(item, t)]
+
     def resolve(self, item: Item):
         for id_type in ("anilist", "mal"):
             v = getattr(item, id_type)
             if v and (id_type, v) in OVERRIDES:
                 return OVERRIDES[(id_type, v)]
 
-        keys = [f"{t}:{getattr(item, t)}" for t in ("anilist", "mal") if getattr(item, t)]
+        keys = self._keys(item)
         hit = self.state.cached_mapping(keys)
         if hit:
             return hit
@@ -87,9 +91,10 @@ class Mapper:
         """Items (already in list order) -> deduped targets. Logs what mapped and what didn't."""
         targets, seen, unmapped = [], set(), []
         for it in items:
+            cached_miss = self.state.recently_missed(self._keys(it))
             found = self.resolve(it)
             if not found:
-                unmapped.append(it.name)
+                unmapped.append((it.name, cached_miss))
                 continue
             if tuple(found) in seen:  # e.g. several seasons mapping to the same TMDB show
                 continue
@@ -98,6 +103,7 @@ class Mapper:
         self.state.save()  # persist newly resolved ids
         for i, t in enumerate(targets, 1):
             core.log(f"  {i:>2}. {t.name} ({t.note}) -> {t.media_type}/{t.tmdb}")
-        for name in unmapped:
-            core.log(f"  !! no TMDB mapping: {name}")
+        for name, cached_miss in unmapped:
+            suffix = " (cached miss; lookup skipped)" if cached_miss else ""
+            core.log(f"  !! no TMDB mapping: {name}{suffix}")
         return targets

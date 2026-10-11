@@ -1,0 +1,6 @@
+[project]
+name = "animelists"
+version = "0.1.0"
+description = "Sync anime lists to PublicMetaDB and MDBList"
+requires-python = ">=3.10"
+dependencies = ["requests", "python-dotenv"]
