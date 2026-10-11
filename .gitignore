@@ -1,0 +1,6 @@
+.env
+sync_state.json
+sync_state.json.tmp
+run.log
+__pycache__/
+.pytest_cache/
